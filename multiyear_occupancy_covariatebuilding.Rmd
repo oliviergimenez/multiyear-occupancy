@@ -1,0 +1,597 @@
+---
+title: "Analyses occupancy pluri-annuelles"
+author: "Olivier Gimenez"
+date: "Nov 2020"
+output: 
+  html_document:
+    toc: TRUE
+    toc_depth: 2
+    number_sections: true
+    theme: united
+    highlight: tango
+    df_print: paged
+#    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      cache = FALSE, 
+#                      message = FALSE, 
+#                      warning = FALSE, 
+                      dpi = 600, 
+                      fig.height = 6, 
+                      fig.width = 1.777777*6)
+library(coda)
+library(viridis)
+library(tidyverse)
+library(sf)
+library(patchwork)
+library(MCMCvis)
+theme_set(theme_light(base_size = 8))
+```
+
+# Introduction
+
+Occupancy or the proportion of country occupied by a species may be used as an ecological indicator. Appealing because trends can be assessed and imperfect species detection can be accounted for. For multi-year studies, we usually go for dynamic occupancy models to deal with the violation of the closure assumption. 
+
+Here, instead of a dynamic occupancy model, we go for static (aka single-season) occupancy applied each year. In theory, there are two problems with this approach: a problem of temporal autocorrelation and also a problem of no access to drivers of occupancy dynamics through local colonization and extinction probabilities. First issue will be dealt with below. Second issue is not actually an issue if we are to think of indicators for which we need values and trends, not necessarily mechanisms. 
+
+Our approach is not new. Introduced by Isaac et al. (2014), then improved by Outhwaite et al. (2018) with a random walk to account for temporal autocorrelation. Also used by Dennis et al. (2017, 2019) who proposed a 2-step approach - first fit a static model per year, second fit another model on occupancy estimates - but this boils down to do stats on stats, not a fan. 
+
+# Format data
+
+Load environmental data and standardize:
+```{r}
+lynx_shp <- st_read("shp/lynx_data.shp") %>%
+  mutate(forest = as.numeric(scale(prc_frt)),
+         shrubst = as.numeric(scale(shrub)),
+         openland = as.numeric(scale(opn_lnd)),
+         agri21 = as.numeric(scale(twentyn)),
+         agri22 = as.numeric(scale(twntytw)),
+         agri23 = as.numeric(scale(twntyth)),
+         agri24 = as.numeric(scale(twntyfr)),
+         dtohighway = as.numeric(scale(dhighwy)),
+         humdens = as.numeric(scale(log(density + 0.001))),
+         lengthroad = as.numeric(scale(lngthrd)))
+```
+
+Visualise forest cover on a map:
+```{r echo=FALSE}
+# function to visualise habitat covariates
+plot_cov <- function(mydf, mycov, myname, mylegendname, mypalette){
+  ggplot2::ggplot(data = {{ mydf }}) + 
+  ggplot2::geom_sf(colour = "grey50", fill = "white", lwd = 0.01) + 
+  ggplot2::geom_sf(lwd = 0.01, aes(fill = {{ mycov }})) + 
+  viridis::scale_fill_viridis(
+    name = {{ mylegendname }}, 
+    direction = -1,
+    alpha = 0.7,
+    option = {{ mypalette }}) + 
+  ggplot2::labs(title = {{ myname }},
+                x = "",
+                y = "")
+}
+
+(plot_cov(lynx_shp, prc_frt, "forest cover", "percentage", "viridis") | 
+plot_cov(lynx_shp, shrub, "shrub", "percentage", "viridis") |
+plot_cov(lynx_shp, opn_lnd, "open land", "percentage", "magma")) /
+(plot_cov(lynx_shp, twentyn, "CLC21", "percentage", "plasma") |
+plot_cov(lynx_shp, twntytw, "CLC22", "percentage", "plasma") |
+plot_cov(lynx_shp, twntyth, "CLC23", "percentage", "plasma") |
+plot_cov(lynx_shp, twntyfr, "CLC24", "percentage", "plasma")) /
+(plot_cov(lynx_shp, dhighwy, "distance to highway", "distance", "inferno") |
+plot_cov(lynx_shp, log(density + 0.001), "hum dens (log)", "density", "inferno") |
+plot_cov(lynx_shp, lngthrd, "road length", "length", "inferno"))
+```
+
+Load occupancy data and grid:
+```{r}
+load('dat/grid_and_occdata.RData')
+occ <- ifelse(occ > 0,1,0)
+```
+
+Get effort, build year and survey covariates:
+```{r}
+binary.effort <- ifelse(effort_tot > 0,1,0)
+effort <- apply(effort_tot,2,scale)
+```
+
+Let us visualise the effort on maps:
+```{r echo=FALSE}
+plot_eff <- function(mydf, myef, myyear){
+  ggplot2::ggplot({{ mydf }}) + 
+  ggplot2::geom_sf(colour = "grey50", fill = "white", lwd = 0.01) + 
+  ggplot2::geom_sf(lwd = 0.01, 
+          aes(fill = cut({{ myef }},
+                         breaks = c(1,5,10,15,20,25,30,35,40,45,50,55,+Inf), 
+                         right = FALSE,
+                         labels = c("[0-5[", 
+                                    "[5-10[",
+                                    "[10-15[",
+                                    "[15-20[",
+                                    "[20-25[",
+                                    "[25-30[",
+                                    "[30-35[",
+                                    "[35-40[",
+                                    "[40-45[",
+                                    "[45-50[",
+                                    "[50-55[",
+                                    ">=55")))) + 
+  viridis::scale_fill_viridis(
+    name = 'Number of observers', 
+    direction = -1,
+    alpha = 0.7,
+    na.value = "gray80",
+    discrete = TRUE) + 
+  ggplot2::labs(title = glue::glue("", {{ myyear }}),
+       x = "",
+       y = "")
+}
+
+(plot_eff(lynx_shp, ef_1994, 1994) | plot_eff(lynx_shp, ef_1995, 1995) | plot_eff(lynx_shp, ef_1996, 1996) | plot_eff(lynx_shp, ef_1997, 1997) | plot_eff(lynx_shp, ef_1998, 1998) | plot_eff(lynx_shp, ef_1999, 1999)) / (plot_eff(lynx_shp, ef_2000, 2000) | plot_eff(lynx_shp, ef_2001, 2001) | 
+plot_eff(lynx_shp, ef_2002, 2002) | plot_eff(lynx_shp, ef_2003, 2003) | plot_eff(lynx_shp, ef_2004, 2004) | plot_eff(lynx_shp, ef_2005, 2005)) / 
+(plot_eff(lynx_shp, ef_2006, 2006) | plot_eff(lynx_shp, ef_2007, 2007) | plot_eff(lynx_shp, ef_2008, 2008) | plot_eff(lynx_shp, ef_2009, 2009) | 
+plot_eff(lynx_shp, ef_2010, 2010) | plot_eff(lynx_shp, ef_2011, 2011)) / (plot_eff(lynx_shp, ef_2012, 2012) | plot_eff(lynx_shp, ef_2013, 2013) |
+plot_eff(lynx_shp, ef_2014, 2014) | plot_eff(lynx_shp, ef_2015, 2015) | plot_eff(lynx_shp, ef_2016, 2016)) + plot_layout(guides = "collect") & 
+  theme(legend.position = "none")
+```
+
+Convert occupancy dataset in a 3D array:
+```{r}
+y <- list()
+ind <- 0
+for (i in 1:23){
+	mask <- (ind + i):(ind + i + 3)
+	y[[i]] <- occ[,mask]
+	ind <- ind + 3
+}
+```
+
+Convert list into array (https://stackoverflow.com/questions/37433509/convert-list-to-a-matrix-or-array):
+```{r}
+y <- array(unlist(y), dim = c(nrow(y[[1]]), ncol(y[[1]]), length(y)))
+dim(y)
+```
+
+Get dataset characteristics:
+```{r}
+nsites <- dim(y)[1]
+nvisits <- dim(y)[2]
+nyears <- dim(y)[3]
+```
+
+
+# Fully Bayesian approach
+
+We're gonna fit the Isaac-Outhwaite model which has a random walk for time, and a random effect for space. We start with the model code:
+```{r}
+model <- 
+paste("
+model
+{
+  
+  # State model priors
+  b[1] ~ dnorm(mu.b, 1)           # random walk prior on year effect
+  for(j in 2:nyears){
+    b[j] ~ dnorm(b[j-1], tau.b)
+  }
+  tau.b <- 1 / (sd.b * sd.b)
+  mu.b ~ dnorm(0, 1)
+  sd.b ~ dunif(0, 5)		# half-uniform hyperpriors
+  
+  for (i in 1:nsites){
+    u[i] ~ dnorm(0, tau.u) 	# random site effect      
+  } 
+  tau.u <- 1 / (sd.u * sd.u)
+  sd.u ~ dunif(0, 5)		# half-uniform hyperpriors
+  
+  ## priors for alpha and beta coeffs
+  for(i in 1:2) {
+    beta[i]  ~ dnorm(0, 1)
+  }
+  for(i in 1:10) {
+    alpha[i] ~ dnorm(0, 1)
+  }
+  for(i in 1:nsites) {
+    for(j in 1:nyears) {
+      logit(phi[i,j]) <- alpha[1] * forest[i] + alpha[2] * shrubst[i] + alpha[3] * openland[i] + 
+        alpha[4] * agri21[i] + alpha[5] * agri22[i] + alpha[6] * agri23[i] + alpha[7] * agri24[i] + 
+        alpha[8] * dtohighway[i] + alpha[9] * humdens[i] + alpha[10] * lengthroad[i] + b[j] + u[i]
+      z[i,j] ~ dbern(phi[i,j])  ## true pres/absences states
+      lp[i,j] <- beta[1] + beta[2] * effort[i,j]
+      p[i,j] <- (1 / (1 + exp(-lp[i,j]))) * (1 - step(-binary.effort[i,j]))
+      y[i,j] ~ dbin(p[i,j] * z[i, j], nvisits)  ## likelihood
+    }
+  }
+  
+  # Finite sample occupancy - proportion of occupied sites
+  for (j in 1:nyears) {
+    psi.fs[j] <- sum(z[1:nsites,j]) / nsites.year[j]
+  }
+
+    # Also save recent maps
+    for(i in 1:nsites) {
+      map1[i] <- z[i, nyears - 2]
+      map2[i] <- z[i, nyears - 1]
+      map3[i] <- z[i, nyears]
+    }
+}
+")
+writeLines(model,"code/occ.txt")
+
+```
+
+Build list of data.
+```{r}
+datax <- list(nsites = nsites, 
+                  nvisits = nvisits, 
+                  nyears = nyears, 
+                  effort = effort, 
+                  forest = lynx_shp$forest, 
+                  shrubst = lynx_shp$shrubst,
+                  openland = lynx_shp$openland,
+                  agri21 = lynx_shp$agri21,
+                  agri22 = lynx_shp$agri22,
+                  agri23 = lynx_shp$agri23,
+                  agri24 = lynx_shp$agri24,
+                  dtohighway = lynx_shp$dtohighway,
+                  humdens = lynx_shp$humdens,
+                  lengthroad = lynx_shp$lengthroad,
+                  binary.effort = binary.effort,
+                  nsites.year = apply(binary.effort,2,sum),
+                  y = apply(y, c(1,3), sum))
+```
+
+Buid list of inits:
+```{r}
+zst <- datax$y
+zst[zst > 0] <- 1
+init1 <- list(alpha = runif(10, -2, 2),
+              beta = runif(2, -2, 2),
+              z = zst,
+              b = rep(0, nyears),
+              mu.b = 0,
+              u = rep(0, nsites),
+              sd.b = 1,
+              sd.u = 1)
+
+init2 <- list(alpha = runif(10, -2, 2),
+              beta = runif(2, -2, 2),
+              z = zst,
+              b = rep(0, nyears),
+              mu.b = 0,
+              u = rep(0, nsites),
+              sd.b = 1,
+              sd.u = 1)
+
+inits <- list(init1, init2)
+```
+
+Specify parameters to be monitored:
+```{r}
+parameters <- c("psi.fs",
+                "alpha",
+                "beta",
+#                "u",
+                "b",
+                "mu.b",
+                "sd.u",
+                "sd.b")
+#                "phi",
+#                "map1",
+#                "map2",
+#                "map3")
+```
+
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+library(jagsUI)
+lynx.sim <- jags(data = datax, 
+                inits = inits, 
+                parameters = parameters,
+                n.iter = 10000,
+                model.file = "code/occ.txt",
+                n.chains = 2,
+                n.burnin = 2500)
+save(lynx.sim, file='lynx.RData')
+```
+
+Let's have a look to the parameter estimates:
+```{r echo=FALSE}
+library(jagsUI)
+load('lynx.RData')
+round(lynx.sim$summary,2)
+```
+
+Trace of the slope of the effects of the covariates on the occupancy probability, the alpha's. Tells us that the convergence is satisfying: 
+```{r echo=FALSE}
+MCMCtrace(lynx.sim, params = 'alpha', ISB = FALSE, ind = TRUE, Rhat = TRUE, n.eff = TRUE, pdf = FALSE)
+```
+
+Trace of the time effects on the occupancy probability, the b's, and a few other parameters with 'b' in ther name. Tells us that the convergence is sataisfying: 
+```{r echo=FALSE}
+MCMCtrace(lynx.sim, params = 'b', ISB = FALSE, ind = TRUE, Rhat = TRUE, n.eff = TRUE, pdf = FALSE)
+```
+
+Let's have a look to the effect size:
+```{r echo=FALSE}
+MCMCplot(object = lynx.sim, 
+         params = 'alpha', 
+         rank = TRUE,
+         labels = c("forest","shrub","openland","agri21","agri22","agri23","agri24","disttohighway","humdens","roadlength"))
+```
+
+
+Compare naive and estimated trend in occupancy. The variation in estimated occupancy look similar to that of naive occupancy. Occupancy estimates are bigger than naive occupancy.
+```{r echo=FALSE}
+samples <- rbind(lynx.sim$samples[[1]], lynx.sim$samples[[2]])
+# str(samples)
+# length(samples[,'psi.fs[1]'])
+# colnames(samples)
+names.psifs <- grep('psi.fs',colnames(samples))
+psi.fs <- samples[,names.psifs]
+# dim(psi.fs)
+estim.occ <- apply(psi.fs,2,mean)
+naive.occ <- apply(apply(y, c(1,3), max), 2, sum, na.rm = T) / apply(binary.effort, 2, sum)
+df <- data.frame(years = rep(1:23, 2), 
+                 occ = c(rep("naive", 23), rep("estimated", 23)),
+                 value = c(naive.occ, estim.occ))
+df %>%
+  ggplot() + 
+  aes(x = years, y = value, color = occ) +
+  geom_line(lwd = 2) + 
+  labs(x = "year",
+       y = "value",
+       title = "Naive vs estimated occupancy",
+       color = "")
+```
+
+We visualise the effect of covariates on the occupancy probability, for the last year of the data. We pick four covariates for illustration. Two have a negative effect (agri21 and distance to highway), one has a positive effect (forest) and one has no effect (open land). Note that the scale of the Y-axis is the same for all four covariates. We see that the strongest effect is that of forest, while the negative effects of agri21 and distance to highway is actually of order of magnitude of the null effect of open land.
+```{r echo=FALSE}
+grid_agri21 <- seq(min(datax$agri21), max(datax$agri21), length = 100)
+grid_dhighw <- seq(min(datax$dtohighway), max(datax$dtohighway), length = 100)
+grid_forest <- seq(min(datax$forest), max(datax$forest), length = 100)
+grid_ol <- seq(min(datax$openland), max(datax$openland), length = 100)
+pred_agri21 <- plogis(mean(samples[,'b[23]']) + grid_agri21 * mean(samples[,'alpha[4]']))
+pred_dtohighw <- plogis(mean(samples[,'b[23]']) + grid_dhighw * mean(samples[,'alpha[8]']))
+pred_forest <- plogis(mean(samples[,'b[23]']) + grid_forest * mean(samples[,'alpha[1]']))
+pred_ol <- plogis(mean(samples[,'b[23]']) + grid_ol * mean(samples[,'alpha[3]']))
+
+df <- data.frame(grid = c(grid_agri21, grid_dhighw, grid_forest, grid_ol),
+                 name = c(rep("agri21", 100), rep("dtohighway", 100), rep("forest", 100), rep("openland", 100)),
+                 occprob = c(pred_agri21, pred_dtohighw, pred_forest, pred_ol))
+
+df %>%
+  ggplot() + 
+  aes(x = grid, y = occprob, color = name) +
+  geom_line(lwd = 2) + 
+  facet_wrap(~name, scales = "free_x") + 
+  labs(x = "covariate value",
+       y = "estimated occupancy probability") + 
+  theme(legend.position = "none")
+```
+
+Is it comparable for a year in the middle of the period? Yes.
+```{r echo=FALSE}
+grid_agri21 <- seq(min(datax$agri21), max(datax$agri21), length = 100)
+grid_dhighw <- seq(min(datax$dtohighway), max(datax$dtohighway), length = 100)
+grid_forest <- seq(min(datax$forest), max(datax$forest), length = 100)
+grid_ol <- seq(min(datax$openland), max(datax$openland), length = 100)
+pred_agri21 <- plogis(mean(samples[,'b[13]']) + grid_agri21 * mean(samples[,'alpha[4]']))
+pred_dtohighw <- plogis(mean(samples[,'b[13]']) + grid_dhighw * mean(samples[,'alpha[8]']))
+pred_forest <- plogis(mean(samples[,'b[13]']) + grid_forest * mean(samples[,'alpha[1]']))
+pred_ol <- plogis(mean(samples[,'b[13]']) + grid_ol * mean(samples[,'alpha[3]']))
+
+df <- data.frame(grid = c(grid_agri21, grid_dhighw, grid_forest, grid_ol),
+                 name = c(rep("agri21", 100), rep("dtohighway", 100), rep("forest", 100), rep("openland", 100)),
+                 occprob = c(pred_agri21, pred_dtohighw, pred_forest, pred_ol))
+
+df %>%
+  ggplot() + 
+  aes(x = grid, y = occprob, color = name) +
+  geom_line(lwd = 2) + 
+  facet_wrap(~name, scales = "free_x") + 
+  labs(x = "covariate value",
+       y = "estimated occupancy probability") + 
+  theme(legend.position = "none")
+```
+
+What about the first year of the study? Idem.
+```{r echo=FALSE}
+grid_agri21 <- seq(min(datax$agri21), max(datax$agri21), length = 100)
+grid_dhighw <- seq(min(datax$dtohighway), max(datax$dtohighway), length = 100)
+grid_forest <- seq(min(datax$forest), max(datax$forest), length = 100)
+grid_ol <- seq(min(datax$openland), max(datax$openland), length = 100)
+pred_agri21 <- plogis(mean(samples[,'b[1]']) + grid_agri21 * mean(samples[,'alpha[4]']))
+pred_dtohighw <- plogis(mean(samples[,'b[1]']) + grid_dhighw * mean(samples[,'alpha[8]']))
+pred_forest <- plogis(mean(samples[,'b[1]']) + grid_forest * mean(samples[,'alpha[1]']))
+pred_ol <- plogis(mean(samples[,'b[1]']) + grid_ol * mean(samples[,'alpha[3]']))
+
+df <- data.frame(grid = c(grid_agri21, grid_dhighw, grid_forest, grid_ol),
+                 name = c(rep("agri21", 100), rep("dtohighway", 100), rep("forest", 100), rep("openland", 100)),
+                 occprob = c(pred_agri21, pred_dtohighw, pred_forest, pred_ol))
+
+df %>%
+  ggplot() + 
+  aes(x = grid, y = occprob, color = name) +
+  geom_line(lwd = 2) + 
+  facet_wrap(~name, scales = "free_x") + 
+  labs(x = "covariate value",
+       y = "estimated occupancy probability") + 
+  theme(legend.position = "none")
+```
+
+# Rerun model without non-significant covariates
+
+We're gonna fit the Isaac-Outhwaite model which has a random walk for time, and a random effect for space. We start with the model code:
+```{r}
+model <- 
+paste("
+model
+{
+  
+  # State model priors
+  b[1] ~ dnorm(mu.b, 1)           # random walk prior on year effect
+  for(j in 2:nyears){
+    b[j] ~ dnorm(b[j-1], tau.b)
+  }
+  tau.b <- 1 / (sd.b * sd.b)
+  mu.b ~ dnorm(0, 1)
+  sd.b ~ dunif(0, 5)		# half-uniform hyperpriors
+  
+  for (i in 1:nsites){
+    u[i] ~ dnorm(0, tau.u) 	# random site effect      
+  } 
+  tau.u <- 1 / (sd.u * sd.u)
+  sd.u ~ dunif(0, 5)		# half-uniform hyperpriors
+  
+  ## priors for alpha and beta coeffs
+  for(i in 1:2) {
+    beta[i]  ~ dnorm(0, 1)
+  }
+  for(i in 1:7) {
+    alpha[i] ~ dnorm(0, 1)
+  }
+  for(i in 1:nsites) {
+    for(j in 1:nyears) {
+      logit(phi[i,j]) <- alpha[1] * forest[i] + alpha[2] * shrubst[i] + alpha[3] * agri21[i] + 
+      alpha[4] * agri22[i] + alpha[5] * dtohighway[i] + alpha[6] * humdens[i] + 
+      alpha[7] * lengthroad[i] + b[j] + u[i]
+      z[i,j] ~ dbern(phi[i,j])  ## true pres/absences states
+      lp[i,j] <- beta[1] + beta[2] * effort[i,j]
+      p[i,j] <- (1 / (1 + exp(-lp[i,j]))) * (1 - step(-binary.effort[i,j]))
+      y[i,j] ~ dbin(p[i,j] * z[i, j], nvisits)  ## likelihood
+    }
+  }
+  
+  # Finite sample occupancy - proportion of occupied sites
+#  for (j in 1:nyears) {
+#    psi.fs[j] <- sum(z[1:nsites,j]) / nsites.year[j]
+#  }
+
+#    # Also save recent maps
+#    for(i in 1:nsites) {
+#      map1[i] <- z[i, nyears - 2]
+#      map2[i] <- z[i, nyears - 1]
+#      map3[i] <- z[i, nyears]
+#    }
+}
+")
+writeLines(model,"code/occ.txt")
+
+```
+
+Build list of data.
+```{r}
+datax <- list(nsites = nsites, 
+                  nvisits = nvisits, 
+                  nyears = nyears, 
+                  effort = effort, 
+                  forest = lynx_shp$forest, 
+                  shrubst = lynx_shp$shrubst,
+                  agri21 = lynx_shp$agri21,
+                  agri22 = lynx_shp$agri22,
+                  dtohighway = lynx_shp$dtohighway,
+                  humdens = lynx_shp$humdens,
+                  lengthroad = lynx_shp$lengthroad,
+                  binary.effort = binary.effort,
+                  nsites.year = apply(binary.effort,2,sum),
+                  y = apply(y, c(1,3), sum))
+```
+
+Buid list of inits:
+```{r}
+zst <- datax$y
+zst[zst > 0] <- 1
+init1 <- list(alpha = runif(7, -2, 2),
+              beta = runif(2, -2, 2),
+              z = zst,
+              b = rep(0, nyears),
+              mu.b = 0,
+              u = rep(0, nsites),
+              sd.b = 1,
+              sd.u = 1)
+
+init2 <- list(alpha = runif(7, -2, 2),
+              beta = runif(2, -2, 2),
+              z = zst,
+              b = rep(0, nyears),
+              mu.b = 0,
+              u = rep(0, nsites),
+              sd.b = 1,
+              sd.u = 1)
+
+inits <- list(init1, init2)
+```
+
+Specify parameters to be monitored:
+```{r}
+parameters <- c(#"psi.fs",
+                "alpha",
+                "beta",
+#                "u",
+                "b",
+                "mu.b",
+                "sd.u",
+                "sd.b")
+#                "phi",
+#                "map1",
+#                "map2",
+#                "map3")
+```
+
+```{r message=FALSE, warning=FALSE}
+library(jagsUI)
+lynx.sim <- jags(data = datax, 
+                inits = inits, 
+                parameters = parameters,
+                n.iter = 50000,
+                model.file = "code/occ.txt",
+                n.chains = 2,
+                n.burnin = 5000,
+                parallel = TRUE)
+save(lynx.sim, file='lynx-wo.RData')
+```
+
+Let's have a look to the parameter estimates:
+```{r echo=FALSE}
+round(lynx.sim$summary,2)
+```
+
+Trace of the slope of the effects of the covariates on the occupancy probability, the alpha's. Tells us that the convergence is satisfying: 
+```{r echo=FALSE}
+MCMCtrace(lynx.sim, params = 'alpha', ISB = FALSE, ind = TRUE, Rhat = TRUE, n.eff = TRUE, pdf = FALSE)
+```
+
+Trace of the time effects on the occupancy probability, the b's, and a few other parameters with 'b' in ther name. Tells us that the convergence is sataisfying: 
+```{r echo=FALSE}
+MCMCtrace(lynx.sim, params = 'b', ISB = FALSE, ind = TRUE, Rhat = TRUE, n.eff = TRUE, pdf = FALSE)
+```
+
+Let's have a look to the effect size:
+```{r echo=FALSE}
+MCMCplot(object = lynx.sim, 
+         params = 'alpha', 
+         rank = TRUE,
+         labels = c("forest","shrub","agri21","agri22","disttohighway","humdens","roadlength"))
+```
+
+
+# References
+
+Dennis et al. (2017). Efficient occupancy model-fitting for extensive citizen-science data. PLoS ONE 12(3): e0174433.
+
+Dennis et al. (2019). Trends and indicators for quantifying moth abundance and occupancy in Scotland. Journal of Insect Conservation. 23: 369–380
+
+Isaac et al. (2014). Statistics for citizen science: extracting signals of change from noisy ecological data. Methods in Ecology and Evolution. 5: 1052-1060.
+
+Lee et al. (2018). Spatio-Temporal Areal Unit Modeling in R with Conditional Autoregressive Priors Using the CARBayesST Package. Journal of Statistical Software. 84:9.
+
+Outhwaite et al. (2018). Prior specification in Bayesian occupancy modelling improves analysis of species occurrence data. Ecological Indicators. 93: 333-343.
+
+Rushing et al. (2019). Modeling spatially and temporally complex range dynamics when detection is imperfect. Scientific Reports. 9: 12805.
+
+# Session info
+
+```{r}
+sessionInfo()
+```
